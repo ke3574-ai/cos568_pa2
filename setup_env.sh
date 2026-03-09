@@ -28,3 +28,17 @@ pip3 install --user pandas matplotlib
 echo "----------------------------------------"
 echo "Setup complete! Please run 'source ~/.bashrc' manually now."
 echo "----------------------------------------"
+
+#!/bin/bash
+
+REPO_URL="git@github.com:ke3574-ai/cos568_pa2"
+
+# This pulls the name of the repo out of the URL (e.g., 'my-repo')
+REPO_NAME=$(basename "$REPO_URL" .git)
+
+echo "Cloning $REPO_NAME..."
+git clone "$REPO_URL"
+
+# Now you can use that variable to enter the folder
+cd "$REPO_NAME"
+ls -l
