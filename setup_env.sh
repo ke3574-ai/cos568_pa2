@@ -42,3 +42,8 @@ git clone "$REPO_URL"
 # Now you can use that variable to enter the folder
 cd "$REPO_NAME"
 ls -l
+
+mkdir glue_data
+python3 download_glue_data.py --data_dir glue_data
+
+echo "Downloaded Glue Data!"
