@@ -31,14 +31,14 @@ echo "----------------------------------------"
 
 #!/bin/bash
 
-REPO_URL="git@github.com:ke3574-ai/cos568_pa2"
+REPO_URL="https://github.com/ke3574-ai/cos568_pa2.git"
 
 # This pulls the name of the repo out of the URL (e.g., 'my-repo')
 REPO_NAME=$(basename "$REPO_URL" .git)
 
 echo "Cloning $REPO_NAME..."
 git clone "$REPO_URL"
-
+echo "Cloned repo!"
 # Now you can use that variable to enter the folder
 cd "$REPO_NAME"
 ls -l
@@ -47,3 +47,8 @@ mkdir glue_data
 python3 download_glue_data.py --data_dir glue_data
 
 echo "Downloaded Glue Data!"
+
+export GLUE_DIR=$HOME/cos568_pa2/glue_data
+export TASK_NAME=RTE
+
+echo "Exported glue dir and task name!"

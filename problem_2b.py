@@ -172,41 +172,35 @@ def train(args, train_dataset, model, tokenizer):
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
 
-                if step % 100 == 0: # Only log every 100 steps to keep the console clean
-                    logger.info("[%s] Step %d: Starting gradient synchronization...", my_identity, step)
-                # --- START DISTRIBUTED SYNC ---
-                # 1. Flatten local gradients into a single 1D vector
-                local_grad = get_flat_grads(model)
-                
-                # 2. Prepare buffers on the Namer (Rank 0)
-                if args.rank == 0:
-                    # A list of 4 empty tensors to catch everyone's "suitcases"
-                    gather_list = [torch.zeros_like(local_grad) for _ in range(args.world_size)]
-                else:
-                    gather_list = None
-
-                # 3. GATHER: Everyone sends their local_grad to the Namer
-                torch.distributed.gather(local_grad, gather_list, dst=0)
-
-                # 4. AVERAGE & PREPARE SCATTER (Namer only)
-                if args.rank == 0:
-                    if step % 100 == 0:
-                        logger.info("[%s] Namer: Received all gradients. Averaging...", my_identity)
-                    # Stack into a 4xN matrix and average element-wise
-                    mean_grad = torch.stack(gather_list).mean(dim=0)
-                    # Create a list containing 4 copies of the mean vector
-                    scatter_list = [mean_grad for _ in range(args.world_size)]
-                else:
-                    scatter_list = None
-
-                # 5. SCATTER: Namer sends the mean vector back to everyone
-                # This overwrites 'local_grad' on every node with the Fellowship's average
-                torch.distributed.scatter(local_grad, scatter_list, src=0)
-
-                # 6. UNPACK: Overwrite local p.grad with the averaged version
-                set_flat_grads(model, local_grad)
                 if step % 100 == 0:
-                    logger.info("[%s] Step %d: Sync complete. Updating weights.", my_identity, step)
+                    logger.info("[%s] Step %d: Starting all_reduce synchronization...", my_identity, step)
+                
+                # --- START DISTRIBUTED SYNC (All-Reduce version) ---
+                
+                # 1. Flatten local gradients
+                local_grad = get_flat_grads(model)
+
+                # Optional: Log the local norm to verify nodes have different data
+                if step % 100 == 0:
+                    local_norm = torch.norm(local_grad).item()
+                    logger.info("[%s] Pre-sync gradient norm: %.4f", my_identity, local_norm)
+
+                # 2. ALL_REDUCE: The Fellowship sums their gradients
+                # This is a blocking call. Everyone waits here for the slowest node.
+                torch.distributed.all_reduce(local_grad, op=torch.distributed.ReduceOp.SUM)
+
+                # 3. AVERAGE: Divide by world_size to get the mean
+                local_grad /= args.world_size
+
+                # 4. UNPACK: Overwrite local p.grad with the Fellowship's average
+                set_flat_grads(model, local_grad)
+                
+                # --- END DISTRIBUTED SYNC ---
+
+                if step % 100 == 0:
+                    # Verification: This norm should now be EXACTLY the same on all nodes
+                    global_norm = torch.norm(local_grad).item()
+                    logger.info("[%s] Step %d: Sync complete. Global gradient norm: %.4f", my_identity, step, global_norm)
                 # --- END DISTRIBUTED SYNC ---
 
                 ##################################################
@@ -464,6 +458,8 @@ def main():
     args = parser.parse_args()
 
     my_identity = IDENTITIES[args.rank]
+    os.environ['MASTER_ADDR'] = args.master_ip
+    os.environ['MASTER_PORT'] = args.master_port
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -506,6 +502,12 @@ def main():
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
     print("loaded model")
     ##################################################
+
+    dist.init_process_group(
+        backend="gloo",          # Best for CloudLab TCP networks
+        rank=args.rank,          # 0, 1, 2, or 3
+        world_size=args.world_size # 4
+    )
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
