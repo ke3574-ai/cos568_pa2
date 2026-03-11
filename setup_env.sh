@@ -43,6 +43,8 @@ echo "Cloned repo!"
 cd "$REPO_NAME"
 ls -l
 
+chmod -R +x .
+
 mkdir glue_data
 python3 download_glue_data.py --data_dir glue_data
 
