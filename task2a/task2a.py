@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -70,15 +71,14 @@ def set_seed(args):
 
 
 def train(args, train_dataset, model, tokenizer):
-    """ Train the model """
+    """ Train the model using Gather/Scatter manual sync + Monitoring """
 
     args.train_batch_size = args.per_device_train_batch_size
     
-    #Distibuted Sampler
     train_sampler = DistributedSampler(
         train_dataset, 
         num_replicas=args.world_size, 
-        rank=args.rank, 
+        rank=args.local_rank, 
         shuffle=True
     )
 
@@ -87,144 +87,145 @@ def train(args, train_dataset, model, tokenizer):
         sampler=train_sampler, 
         batch_size=args.train_batch_size
     )
-    my_identity = IDENTITIES[args.rank]
+
+    # --- [MONITORING ADDITION]: INITIALIZE HISTORIES ---
+    loss_history = []
+    time_history = [] 
+
+    # --- [MONITORING ADDITION]: STABILIZED PROFILER CONFIG ---
+    # wait=2, warmup=2 helps skip the initial slow iterations in the trace
+    prof_schedule = torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1)
+    
+    def trace_handler(p):
+        output = f"trace_gather_scatter_rank_{args.local_rank}.json"
+        p.export_chrome_trace(output)
+        logger.info(f"Saved Gather/Scatter profile trace to {output}")
+
+    my_identity = IDENTITIES[args.local_rank]
+    
+    # Calculate optimization steps
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    # Prepare optimizer and schedule (linear warmup and decay)
+    # Optimizer setup
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+    ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-
-    # # Train!
-    # logger.info("***** Running training *****")
-    # logger.info("  Num examples = %d", len(train_dataset))
-    # logger.info("  Num Epochs = %d", args.num_train_epochs)
-    # logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
-    # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-    #                args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    # logger.info("  Total optimization steps = %d", t_total)
-
-    logger.info("[%s] ***** Running training *****", my_identity)
-    logger.info("[%s]   Num examples = %d", my_identity, len(train_dataset))
-    logger.info("[%s]   Num Epochs = %d", my_identity, args.num_train_epochs)
-    logger.info("[%s]   Instantaneous batch size per device = %d", my_identity, args.per_device_train_batch_size)
-
-    # Calculate global batch size
-    world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
-    total_batch_size = args.train_batch_size * args.gradient_accumulation_steps * world_size
-
-    logger.info("[%s]   Total train batch size (w. parallel, distributed & accumulation) = %d", my_identity, total_batch_size)
-    logger.info("[%s]   Gradient Accumulation steps = %d", my_identity, args.gradient_accumulation_steps)
-    logger.info("[%s]   Total optimization steps = %d", my_identity, t_total)
 
     global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for epoch in train_iterator:
-        # 2. THE CRITICAL CHANGE: Tell the sampler which epoch we are in.
-        # This ensures each node gets a UNIQUE but SHUFFLED slice of data.
-        if isinstance(train_dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
-            train_dataloader.sampler.set_epoch(epoch)
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[3]}
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            if global_step <= 5:
-                # Use .item() to get a standard Python float
-                print(f"Step {global_step} | Loss: {loss.item():.4f}")
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+    set_seed(args)
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                ##################################################
-                # TODO(cos568): perform backward pass here (expect one line of code)
-                loss.backward()
-                ##################################################
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+    # --- [MONITORING ADDITION]: START PROFILER CONTEXT ---
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=prof_schedule,
+        on_trace_ready=trace_handler,
+        record_shapes=True,
+        with_stack=False  # Required for stability on certain CPU architectures
+    ) as prof:
 
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-
-                if step % 100 == 0:
-                    logger.info("[%s] Step %d: Starting all_reduce synchronization...", my_identity, step)
-                
-                # --- START DISTRIBUTED SYNC (All-Reduce version) ---
-                
-                # 1. Flatten local gradients
-                local_grad = get_flat_grads(model)
-
-                # Optional: Log the local norm to verify nodes have different data
-                if step % 100 == 0:
-                    local_norm = torch.norm(local_grad).item()
-                    logger.info("[%s] Pre-sync gradient norm: %.4f", my_identity, local_norm)
-
-                # 2. ALL_REDUCE: The Fellowship sums their gradients
-                # This is a blocking call. Everyone waits here for the slowest node.
-                torch.distributed.all_reduce(local_grad, op=torch.distributed.ReduceOp.SUM)
-
-                # 3. AVERAGE: Divide by world_size to get the mean
-                local_grad /= args.world_size
-
-                # 4. UNPACK: Overwrite local p.grad with the Fellowship's average
-                set_flat_grads(model, local_grad)
-                
-                # --- END DISTRIBUTED SYNC ---
-
-                if step % 100 == 0:
-                    # Verification: This norm should now be EXACTLY the same on all nodes
-                    global_norm = torch.norm(local_grad).item()
-                    logger.info("[%s] Step %d: Sync complete. Global gradient norm: %.4f", my_identity, step, global_norm)
-                # --- END DISTRIBUTED SYNC ---
-
-                ##################################################
-                # TODO(cos568): perform a single optimization step
-                optimizer.step()
-                ##################################################
-                scheduler.step() # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
-
-            if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
-                break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
+        train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
         
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        if args.rank == 0:
-            evaluate(args=args, model=model, tokenizer=tokenizer)
-            logger.info("[%s] Evaluation performed.", my_identity)
-        torch.distributed.barrier()
-        ##################################################
+        for epoch in train_iterator:
+            # --- [MONITORING ADDITION]: TRACKERS FOR STEADY-STATE TIMING ---
+            epoch_start_time_after_warmup = None
+            timed_steps_count = 0
+
+            if isinstance(train_dataloader.sampler, DistributedSampler):
+                train_dataloader.sampler.set_epoch(epoch)
+            
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+            
+            for step, batch in enumerate(epoch_iterator):
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {'input_ids': batch[0], 'attention_mask': batch[1], 'labels': batch[3]}
+                
+                outputs = model(**inputs)
+                loss = outputs[0]
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                tr_loss += loss.item()
+
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    
+                    # --- MANUAL GATHER/SCATTER SYNC (Task 2a) ---
+                    local_grad = get_flat_grads(model)
+                    
+                    if args.local_rank == 0:
+                        gather_list = [torch.zeros_like(local_grad) for _ in range(args.world_size)]
+                    else:
+                        gather_list = None
+
+                    torch.distributed.gather(local_grad, gather_list, dst=0)
+
+                    if args.local_rank == 0:
+                        mean_grad = torch.stack(gather_list).mean(dim=0)
+                        scatter_list = [mean_grad for _ in range(args.world_size)]
+                    else:
+                        scatter_list = None
+
+                    torch.distributed.scatter(local_grad, scatter_list, src=0)
+                    set_flat_grads(model, local_grad)
+
+                    # Update model parameters
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+                    global_step += 1
+
+                    # --- [MONITORING ADDITION]: TIMING AFTER UPDATES ---
+                    if step == 0:
+                        # Step 0 is fully done. Start clock for the rest of the iterations.
+                        epoch_start_time_after_warmup = time.time()
+                    elif epoch_start_time_after_warmup is not None:
+                        # Increment count for iterations excluding the first one
+                        timed_steps_count += 1
+                    
+                    # Store loss item for our curve
+                    loss_history.append(loss.item())
+
+                # Step profiler for trace alignment
+                prof.step()
+
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    break
+
+            # --- [MONITORING ADDITION]: CALCULATE STEADY-STATE STATS ---
+            if epoch_start_time_after_warmup is not None and timed_steps_count > 0:
+                # Time from end of step 0 to end of epoch
+                steady_state_duration = time.time() - epoch_start_time_after_warmup
+                # Average duration of the N-1 steps
+                avg_time_per_it = steady_state_duration / timed_steps_count
+                
+                time_history.append((epoch, avg_time_per_it, steady_state_duration))
+                
+                logger.info("Rank %d | Epoch %d | Steady-state Avg: %.4f s | Timed Steps: %d", 
+                            args.local_rank, epoch, avg_time_per_it, timed_steps_count)
+
+    # --- [MONITORING ADDITION]: FINAL CSV EXPORT ---
+    with open(f"loss_gather_rank_{args.local_rank}.csv", "w") as f:
+        f.write("step,loss\n")
+        for i, l in enumerate(loss_history):
+            f.write(f"{i},{l}\n")
+
+    with open(f"timing_gather_rank_{args.local_rank}.csv", "w") as f:
+        f.write("epoch,avg_time_per_it,total_steady_state_time\n")
+        for e, avg, tot in time_history:
+            f.write(f"{e},{avg:.6f},{tot:.6f}\n")
 
     return global_step, tr_loss / global_step
 
@@ -233,7 +234,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
-    my_identity = IDENTITIES[args.rank]
+    my_identity = IDENTITIES[args.local_rank]
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
         eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
@@ -284,11 +285,15 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank == 0:
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
+        
+        for key in sorted(result.keys()):
+            print(f"\nEval Result: \n{key}={str(result[key])}")
 
     return results
 
@@ -450,14 +455,13 @@ def main():
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
     
     #Distributed Training Args
-    parser.add_argument("--rank", type=int)
     parser.add_argument("--master_ip", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="23456")
     parser.add_argument("--world_size", type=int, default=4)
 
     args = parser.parse_args()
 
-    my_identity = IDENTITIES[args.rank]
+    my_identity = IDENTITIES[args.local_rank]
     os.environ['MASTER_ADDR'] = args.master_ip
     os.environ['MASTER_PORT'] = args.master_port
 
@@ -487,6 +491,13 @@ def main():
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
+    dist.init_process_group(
+        backend='gloo',
+        init_method=f'tcp://{args.master_ip}:{args.master_port}',
+        rank=args.local_rank,
+        world_size=args.world_size
+    )
+
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -501,13 +512,6 @@ def main():
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
     print("loaded model")
-    ##################################################
-
-    dist.init_process_group(
-        backend="gloo",          # Best for CloudLab TCP networks
-        rank=args.rank,          # 0, 1, 2, or 3
-        world_size=args.world_size # 4
-    )
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -515,7 +519,7 @@ def main():
     model.to(args.device)
 
     # 1. Rank 0 packs the "Master Truth" into a single vector
-    if args.rank == 0:
+    if args.local_rank == 0:
         flat_weights = get_flat_params(model)
     else:
         # Others prepare an empty buffer of the correct size to receive the data
@@ -529,12 +533,12 @@ def main():
     # 3. Everyone (especially Ranks 1-3) unpacks the data into their local model
     set_flat_params(model, flat_weights)
 
-    if args.rank != 0:
+    if args.local_rank != 0:
         logger.info("%s: Loaded Init Weights", my_identity)
     else:
         logger.info("%s: Sent Init Weights", my_identity)
 
-    print(f"Rank {args.rank}: Fellowship synchronized. All models are bit-for-bit identical.")
+    print(f"Rank {args.local_rank}: Fellowship synchronized. All models are bit-for-bit identical.")
 
     logger.info("Training/evaluation parameters %s", args)
 

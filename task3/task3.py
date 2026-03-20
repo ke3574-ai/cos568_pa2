@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -70,16 +71,21 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
+import time
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm, trange
+
 def train(args, train_dataset, model, tokenizer):
-    """ Train the model """
+    """ Train the model with Distributed Infra + Profiling/Stats """
 
     args.train_batch_size = args.per_device_train_batch_size
     
-    #Distibuted Sampler
     train_sampler = DistributedSampler(
         train_dataset, 
         num_replicas=args.world_size, 
-        rank=args.rank, 
+        rank=args.local_rank, 
         shuffle=True
     )
 
@@ -88,121 +94,158 @@ def train(args, train_dataset, model, tokenizer):
         sampler=train_sampler, 
         batch_size=args.train_batch_size
     )
-    my_identity = IDENTITIES[args.rank]
+    
+    my_identity = IDENTITIES[args.local_rank]
+    
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+    ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
     if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        from apex import amp
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    # # Train!
-    # logger.info("***** Running training *****")
-    # logger.info("  Num examples = %d", len(train_dataset))
-    # logger.info("  Num Epochs = %d", args.num_train_epochs)
-    # logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
-    # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-    #                args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    # logger.info("  Total optimization steps = %d", t_total)
+    # --- [MONITORING ADDITION]: INITIALIZE DATA STRUCTURES ---
+    loss_history = []
+    time_history = [] 
+
+    # --- [MONITORING ADDITION]: CONFIGURE TORCH PROFILER ---
+    prof_schedule = torch.profiler.schedule(wait=1, warmup=0, active=3, repeat=1)
+    
+    def trace_handler(p):
+        output = f"trace_rank_{args.local_rank}.json"
+        p.export_chrome_trace(output)
+        logger.info(f"Rank {args.local_rank} profiling trace saved to {output}")
 
     logger.info("[%s] ***** Running training *****", my_identity)
-    logger.info("[%s]   Num examples = %d", my_identity, len(train_dataset))
-    logger.info("[%s]   Num Epochs = %d", my_identity, args.num_train_epochs)
-    logger.info("[%s]   Instantaneous batch size per device = %d", my_identity, args.per_device_train_batch_size)
-
-    # Calculate global batch size
-    world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
-    total_batch_size = args.train_batch_size * args.gradient_accumulation_steps * world_size
-
-    logger.info("[%s]   Total train batch size (w. parallel, distributed & accumulation) = %d", my_identity, total_batch_size)
-    logger.info("[%s]   Gradient Accumulation steps = %d", my_identity, args.gradient_accumulation_steps)
-    logger.info("[%s]   Total optimization steps = %d", my_identity, t_total)
-
     global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for epoch in train_iterator:
-        # 2. THE CRITICAL CHANGE: Tell the sampler which epoch we are in.
-        # This ensures each node gets a UNIQUE but SHUFFLED slice of data.
-        if isinstance(train_dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
-            train_dataloader.sampler.set_epoch(epoch)
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[3]}
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            if global_step <= 5:
-                # Use .item() to get a standard Python float
-                print(f"Step {global_step} | Loss: {loss.item():.4f}")
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+    set_seed(args)
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+    # --- [STABILIZED PROFILER]: Fixed crash by disabling stack-tracing ---
+    prof_schedule = torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=prof_schedule,
+        on_trace_ready=trace_handler,
+        record_shapes=True,   # KEEP THIS: Crucial for seeing which layers are syncing
+        with_stack=False      # DISABLE THIS: Most likely cause of 'Illegal instruction'
+    ) as prof:
+
+        train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+        
+        for epoch in train_iterator:
+            # --- [MONITORING ADDITION]: TRACK START TIME ---
+            epoch_start_time_after_warmup = None
+            timed_steps_count = 0
+            
+            if isinstance(train_dataloader.sampler, DistributedSampler):
+                train_dataloader.sampler.set_epoch(epoch)
+            
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+            
+            for step, batch in enumerate(epoch_iterator):
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {'input_ids':      batch[0],
+                          'attention_mask': batch[1],
+                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                          'labels':         batch[3]}
+                
+                outputs = model(**inputs)
+                loss = outputs[0]
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                if args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                tr_loss += loss.item()
+
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    # --- [MONITORING ADDITION]: RECORD ITERATION LOSS ---
+                    loss_history.append(loss.item())
+                    
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+                    global_step += 1
+
+                    # --- [MONITORING ADDITION]: THE TIMING TRICK ---
+                    if step == 0:
+                        # Step 0 is 100% complete (including sync/optimizer).
+                        # We start the clock NOW for all remaining iterations.
+                        epoch_start_time_after_warmup = time.time()
+                    else:
+                        # Increment count only for iterations AFTER the first one
+                        timed_steps_count += 1
+
+                # --- [MONITORING ADDITION]: ADVANCE PROFILER STATE ---
+                prof.step()
+
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    epoch_iterator.close()
+                    break
+
+            # --- [MONITORING ADDITION]: CALCULATE STEADY-STATE STATS ---
+            # We check if we actually timed any steps (need at least 2 steps in the epoch)
+            if epoch_start_time_after_warmup is not None and timed_steps_count > 0:
+                # Duration from the END of Step 0 to the END of the Epoch
+                steady_state_duration = time.time() - epoch_start_time_after_warmup
+                
+                # Average = (Total Time excluding Step 0) / (Total Steps excluding Step 0)
+                avg_time_per_it = steady_state_duration / timed_steps_count
+                
+                # Save the 'Clean' stats to your history for the CSV
+                time_history.append((epoch, avg_time_per_it, steady_state_duration))
+                
+                logger.info("Rank %d | Epoch %d | Steady-state Avg: %.4f s | Timed Steps: %d", 
+                            args.local_rank, epoch, avg_time_per_it, timed_steps_count)
             else:
-                ##################################################
-                # TODO(cos568): perform backward pass here (expect one line of code)
-                loss.backward()
-                ##################################################
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                ##################################################
-                # TODO(cos568): perform a single optimization step
-                optimizer.step()
-                ##################################################
-                scheduler.step() # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
+                logger.warning("Rank %d | Epoch %d | Not enough steps to calculate steady-state avg", args.local_rank, epoch)
 
             if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
+                train_iterator.close()
                 break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
-        
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        if args.rank == 0:
-            evaluate(args=args, model=model, tokenizer=tokenizer)
-            logger.info("[%s] Evaluation performed.", my_identity)
-        torch.distributed.barrier()
-        ##################################################
+
+    # --- [MONITORING ADDITION]: EXPORT FINAL STATISTICS TO CSV ---
+    with open(f"loss_curve_rank_{args.local_rank}.csv", "w") as f:
+        f.write("step,loss\n")
+        for i, l in enumerate(loss_history):
+            f.write(f"{i},{l}\n")
+
+    with open(f"timing_stats_rank_{args.local_rank}.csv", "w") as f:
+        f.write("epoch,avg_time_per_it,total_epoch_time\n")
+        for e, avg, total in time_history:
+            f.write(f"{e},{avg:.6f},{total:.6f}\n")
+            
+    logger.info(f"Rank {args.local_rank} successfully saved all CSV statistics.")
 
     return global_step, tr_loss / global_step
-
 
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
-    my_identity = IDENTITIES[args.rank]
+    my_identity = IDENTITIES[args.local_rank]
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
         eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
@@ -253,11 +296,15 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank == 0:
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
+        
+        for key in sorted(result.keys()):
+            print(f"\nEval Result: \n{key}={str(result[key])}")
 
     return results
 
@@ -419,16 +466,32 @@ def main():
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
     
     #Distributed Training Args
-    parser.add_argument("--rank", type=int)
     parser.add_argument("--master_ip", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="23456")
     parser.add_argument("--world_size", type=int, default=4)
 
     args = parser.parse_args()
 
-    my_identity = IDENTITIES[args.rank]
+    print("")
+    my_identity = IDENTITIES[args.local_rank]
     os.environ['MASTER_ADDR'] = args.master_ip
     os.environ['MASTER_PORT'] = args.master_port
+
+    logger.info("***** Distributed Training Configuration *****")
+    logger.info(f"  Process Rank:    {args.local_rank}")
+    logger.info(f"  World Size:      {args.world_size}")
+    logger.info(f"  Master IP:       {args.master_ip}")
+    logger.info(f"  Master Port:     {args.master_port}")
+    print(f"--rank = {args.local_rank}")
+
+    logger.warning(
+        "Process rank: %s, distributed: %s",
+        args.local_rank,
+        bool(args.world_size > 1)
+    )
+
+    print(f"RANK {args.local_rank} CURRENT DIRECTORY: {os.getcwd()}", flush=True)
+    print(f"RANK {args.local_rank} LOG FILE PATH: {os.path.abspath(f'node_{args.local_rank}.log')}", flush=True)
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -456,43 +519,40 @@ def main():
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
+    # Initialize Process Group
+    dist.init_process_group(
+        backend='gloo',
+        init_method=f'tcp://{args.master_ip}:{args.master_port}',
+        rank=args.local_rank,
+        world_size=args.world_size
+    )
+
     # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
+    if args.local_rank !=0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
-    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
-    ##################################################
-    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
-    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-    model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    print("loaded model")
-    ##################################################
-
-    # dist.init_process_group(
-    #     backend="gloo",          # Best for CloudLab TCP networks
-    #     rank=args.rank,          # 0, 1, 2, or 3
-    #     world_size=args.world_size # 4
-    # )
-
-    dist.init_process_group(
-        backend='gloo',
-        init_method=f'tcp://{args.master_ip}:{args.master_port}',
-        rank=args.rank,
-        world_size=args.world_size
+    config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path, 
+        num_labels=num_labels, 
+        finetuning_task=args.task_name
     )
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, 
+        do_lower_case=args.do_lower_case
+    )
+    
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
+    print("Loaded model")
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     model.to(args.device)
+    ddp_model = DDP(model)
 
-    ddp_model = DDP(model, device_ids=[args.rank])
-
-    print(f"Rank {args.rank}: Fellowship synchronized. All models are bit-for-bit identical.")
+    print(f"Rank {args.local_rank}: Fellowship synchronized. All models are bit-for-bit identical.")
 
     logger.info("Training/evaluation parameters %s", args)
 

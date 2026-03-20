@@ -22,6 +22,7 @@ import glob
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -68,18 +69,30 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
     torch.cuda.manual_seed_all(args.seed)
 
+import time
+import logging
+import torch
+import torch.profiler
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm, trange
+from pytorch_transformers import AdamW, WarmupLinearSchedule
+
+# Assuming logger is initialized at the top of your script
+logger = logging.getLogger(__name__)
 
 def train(args, train_dataset, model, tokenizer):
-    """ Train the model """
+    """ Train the model using Manual All-Reduce sync + Steady-State Monitoring """
 
     args.train_batch_size = args.per_device_train_batch_size
     
-    #Distibuted Sampler
+    # Ensure all nodes have the exact same number of steps
     train_sampler = DistributedSampler(
         train_dataset, 
         num_replicas=args.world_size, 
-        rank=args.rank, 
-        shuffle=True
+        rank=args.local_rank, 
+        shuffle=True,
+        drop_last=True    
     )
 
     train_dataloader = DataLoader(
@@ -87,150 +100,157 @@ def train(args, train_dataset, model, tokenizer):
         sampler=train_sampler, 
         batch_size=args.train_batch_size
     )
-    my_identity = IDENTITIES[args.rank]
+
+    my_identity = IDENTITIES[args.local_rank]
+
+    # Calculate optimization steps
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    # Prepare optimizer and schedule (linear warmup and decay)
+    # Prepare optimizer and schedule
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+    ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
     if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        from apex import amp
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    # # Train!
-    # logger.info("***** Running training *****")
-    # logger.info("  Num examples = %d", len(train_dataset))
-    # logger.info("  Num Epochs = %d", args.num_train_epochs)
-    # logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
-    # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-    #                args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    # logger.info("  Total optimization steps = %d", t_total)
-
     logger.info("[%s] ***** Running training *****", my_identity)
-    logger.info("[%s]   Num examples = %d", my_identity, len(train_dataset))
-    logger.info("[%s]   Num Epochs = %d", my_identity, args.num_train_epochs)
-    logger.info("[%s]   Instantaneous batch size per device = %d", my_identity, args.per_device_train_batch_size)
-
-    # Calculate global batch size
-    world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
-    total_batch_size = args.train_batch_size * args.gradient_accumulation_steps * world_size
-
-    logger.info("[%s]   Total train batch size (w. parallel, distributed & accumulation) = %d", my_identity, total_batch_size)
-    logger.info("[%s]   Gradient Accumulation steps = %d", my_identity, args.gradient_accumulation_steps)
-    logger.info("[%s]   Total optimization steps = %d", my_identity, t_total)
-
+    
     global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for epoch in train_iterator:
-        # 2. THE CRITICAL CHANGE: Tell the sampler which epoch we are in.
-        # This ensures each node gets a UNIQUE but SHUFFLED slice of data.
-        if isinstance(train_dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
-            train_dataloader.sampler.set_epoch(epoch)
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[3]}
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            if global_step <= 5:
-                # Use .item() to get a standard Python float
-                print(f"Step {global_step} | Loss: {loss.item():.4f}")
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+    
+    # --- STATISTICS TRACKING ---
+    loss_history = []
+    time_history = [] 
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                ##################################################
-                # TODO(cos568): perform backward pass here (expect one line of code)
-                loss.backward()
-                ##################################################
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+    # --- PROFILER SETUP ---
+    # wait=2 to match our timing trick (skipping first iteration in trace too)
+    prof_schedule = torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1)
+    
+    def trace_handler(p):
+        output = f"trace_allreduce_rank_{args.local_rank}.json"
+        p.export_chrome_trace(output)
+        logger.info(f"Rank {args.local_rank} profiling trace saved to {output}")
 
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+    set_seed(args)
+    
+    # Start the Profiler Context
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=prof_schedule,
+        on_trace_ready=trace_handler,
+        record_shapes=True,
+        with_stack=False # Disabling stack for stability on CPU clusters
+    ) as prof:
 
-                if step % 100 == 0: # Only log every 100 steps to keep the console clean
-                    logger.info("[%s] Step %d: Starting gradient synchronization...", my_identity, step)
-                # --- START DISTRIBUTED SYNC ---
-                # 1. Flatten local gradients into a single 1D vector
-                local_grad = get_flat_grads(model)
+        train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+        
+        for epoch in train_iterator:
+            # --- [TIMING TRICK]: INITIALIZE EPOCH TRACKERS ---
+            epoch_start_time_after_warmup = None
+            timed_steps_count = 0
+
+            if isinstance(train_dataloader.sampler, torch.utils.data.distributed.DistributedSampler):
+                train_dataloader.sampler.set_epoch(epoch)
+            
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+            
+            for step, batch in enumerate(epoch_iterator):
+                model.train()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {'input_ids':      batch[0],
+                          'attention_mask': batch[1],
+                          'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
+                          'labels':         batch[3]}
                 
-                # 2. Prepare buffers on the Namer (Rank 0)
-                if args.rank == 0:
-                    # A list of 4 empty tensors to catch everyone's "suitcases"
-                    gather_list = [torch.zeros_like(local_grad) for _ in range(args.world_size)]
+                outputs = model(**inputs)
+                loss = outputs[0]
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                # Backward pass
+                if args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
                 else:
-                    gather_list = None
+                    loss.backward()
 
-                # 3. GATHER: Everyone sends their local_grad to the Namer
-                torch.distributed.gather(local_grad, gather_list, dst=0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                tr_loss += loss.item()
 
-                # 4. AVERAGE & PREPARE SCATTER (Namer only)
-                if args.rank == 0:
-                    if step % 100 == 0:
-                        logger.info("[%s] Namer: Received all gradients. Averaging...", my_identity)
-                    # Stack into a 4xN matrix and average element-wise
-                    mean_grad = torch.stack(gather_list).mean(dim=0)
-                    # Create a list containing 4 copies of the mean vector
-                    scatter_list = [mean_grad for _ in range(args.world_size)]
-                else:
-                    scatter_list = None
+                # Optimization and All-Reduce step
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    
+                    # --- MANUAL ALL-REDUCE SYNC ---
+                    local_grad = get_flat_grads(model)
+                    torch.distributed.all_reduce(local_grad, op=torch.distributed.ReduceOp.SUM)
+                    local_grad /= args.world_size
+                    set_flat_grads(model, local_grad)
 
-                # 5. SCATTER: Namer sends the mean vector back to everyone
-                # This overwrites 'local_grad' on every node with the Fellowship's average
-                torch.distributed.scatter(local_grad, scatter_list, src=0)
+                    # Update weights
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+                    global_step += 1
 
-                # 6. UNPACK: Overwrite local p.grad with the averaged version
-                set_flat_grads(model, local_grad)
-                if step % 100 == 0:
-                    logger.info("[%s] Step %d: Sync complete. Updating weights.", my_identity, step)
-                # --- END DISTRIBUTED SYNC ---
+                    # --- [TIMING TRICK]: START CLOCK AFTER STEP 0 IS FULLY DONE ---
+                    if step == 0:
+                        # Step 0 included the first flattening, all_reduce, and optimizer call.
+                        # We start the clock NOW to measure pure steady-state speed.
+                        epoch_start_time_after_warmup = time.time()
+                    elif epoch_start_time_after_warmup is not None:
+                        # Increment count for iterations following iteration 0
+                        timed_steps_count += 1
 
-                ##################################################
-                # TODO(cos568): perform a single optimization step
-                optimizer.step()
-                ##################################################
-                scheduler.step() # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
+                    # Record synchronized loss
+                    loss_history.append(loss.item())
+
+                # Step the profiler
+                prof.step()
+
+                if args.max_steps > 0 and global_step > args.max_steps:
+                    epoch_iterator.close()
+                    break
+
+            # --- [TIMING TRICK]: CALCULATE STEADY-STATE AVERAGE ---
+            if epoch_start_time_after_warmup is not None and timed_steps_count > 0:
+                # Time from end of step 0 to the end of the epoch iterator
+                steady_state_duration = time.time() - epoch_start_time_after_warmup
+                # Average duration of the N-1 steps
+                avg_time_per_it = steady_state_duration / timed_steps_count
+                
+                time_history.append((epoch, avg_time_per_it, steady_state_duration))
+                
+                logger.info("Rank %d | Epoch %d | Steady-state Avg: %.4f s | Timed Steps: %d", 
+                            args.local_rank, epoch, avg_time_per_it, timed_steps_count)
 
             if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
+                train_iterator.close()
                 break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
-        
-        ##################################################
-        # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        if args.rank == 0:
-            evaluate(args=args, model=model, tokenizer=tokenizer)
-            logger.info("[%s] Evaluation performed.", my_identity)
-        torch.distributed.barrier()
-        ##################################################
+
+    # --- FINAL: SAVE CSV DATA ---
+    with open(f"loss_curve_allreduce_rank_{args.local_rank}.csv", "w") as f:
+        f.write("step,loss\n")
+        for i, l in enumerate(loss_history):
+            f.write(f"{i},{l}\n")
+
+    with open(f"timing_stats_allreduce_rank_{args.local_rank}.csv", "w") as f:
+        f.write("epoch,avg_time_per_it,total_steady_state_time\n")
+        for e, avg, total in time_history:
+            f.write(f"{e},{avg:.6f},{total:.6f}\n")
+            
+    logger.info(f"Rank {args.local_rank} successfully saved all CSV statistics.")
 
     return global_step, tr_loss / global_step
 
@@ -239,7 +259,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
-    my_identity = IDENTITIES[args.rank]
+    my_identity = IDENTITIES[args.local_rank]
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
         eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
@@ -290,11 +310,15 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+        if args.local_rank == 0:
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(prefix))
+                for key in sorted(result.keys()):
+                    logger.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
+        
+        for key in sorted(result.keys()):
+            print(f"\nEval Result: \n{key}={str(result[key])}")
 
     return results
 
@@ -436,8 +460,6 @@ def main():
     parser.add_argument("--warmup_steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
 
-    # parser.add_argument("--eval_all_checkpoints", action='store_true',
-    #                     help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
                         help="Avoid using CUDA when available")
     parser.add_argument('--overwrite_output_dir', action='store_true',
@@ -456,16 +478,32 @@ def main():
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
     
     #Distributed Training Args
-    parser.add_argument("--rank", type=int)
     parser.add_argument("--master_ip", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="23456")
     parser.add_argument("--world_size", type=int, default=4)
 
     args = parser.parse_args()
 
-    my_identity = IDENTITIES[args.rank]
+    print("")
+    my_identity = IDENTITIES[args.local_rank]
     os.environ['MASTER_ADDR'] = args.master_ip
     os.environ['MASTER_PORT'] = args.master_port
+
+    logger.info("***** Distributed Training Configuration *****")
+    logger.info(f"  Process Rank:    {args.local_rank}")
+    logger.info(f"  World Size:      {args.world_size}")
+    logger.info(f"  Master IP:       {args.master_ip}")
+    logger.info(f"  Master Port:     {args.master_port}")
+    print(f"--rank = {args.local_rank}")
+
+    logger.warning(
+        "Process rank: %s, distributed: %s",
+        args.local_rank,
+        bool(args.world_size > 1)
+    )
+
+    print(f"RANK {args.local_rank} CURRENT DIRECTORY: {os.getcwd()}", flush=True)
+    print(f"RANK {args.local_rank} LOG FILE PATH: {os.path.abspath(f'node_{args.local_rank}.log')}", flush=True)
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -493,61 +531,61 @@ def main():
     label_list = processor.get_labels()
     num_labels = len(label_list)
 
-    # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+    # 1. INITIALIZE FIRST (Essential)
+    dist.init_process_group(
+        backend="gloo",          
+        rank=args.local_rank,          
+        world_size=args.world_size 
+    )
+
+    # 2. COORDINATED LOADING
+    # If not rank 0, wait for rank 0 to finish downloading/loading
+    if args.local_rank != 0:
+        torch.distributed.barrier()
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
-    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
-    ##################################################
-    # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
-    # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-    model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    print("loaded model")
-    ##################################################
 
-    # dist.init_process_group(
-    #     backend="gloo",          # Best for CloudLab TCP networks
-    #     rank=args.rank,          # 0, 1, 2, or 3
-    #     world_size=args.world_size # 4
-    # )
-
-    dist.init_process_group(
-        backend='gloo',
-        init_method=f'tcp://{args.master_ip}:{args.master_port}',
-        rank=args.rank,
-        world_size=args.world_size
+    config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path, 
+        num_labels=num_labels, 
+        finetuning_task=args.task_name
+    )
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, 
+        do_lower_case=args.do_lower_case
     )
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-
+    # Load the model weights
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     model.to(args.device)
+    print(f"Rank {args.local_rank}: loaded model")
 
-    # 1. Rank 0 packs the "Master Truth" into a single vector
-    if args.rank == 0:
-        flat_weights = get_flat_params(model)
+    # Now Rank 0 hits the barrier to release the other ranks
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+
+    # 3. MANUAL SYNC (The "Master Truth" Broadcast)
+    # Ensure the buffer is on the correct device (args.device)
+    total_params = sum(p.numel() for p in model.parameters())
+
+    if args.local_rank == 0:
+        flat_weights = get_flat_params(model).to(args.device)
     else:
-        # Others prepare an empty buffer of the correct size to receive the data
-        total_params = sum(p.numel() for p in model.parameters())
         flat_weights = torch.zeros(total_params).to(args.device)
 
-    # 2. THE BROADCAST: One high-speed transfer over the experimental network
-    # This overwrites the 'flat_weights' on Ranks 1, 2, and 3
+    # Sync everyone to Rank 0's weights
     dist.broadcast(flat_weights, src=0)
 
-    # 3. Everyone (especially Ranks 1-3) unpacks the data into their local model
+    # Unpack
     set_flat_params(model, flat_weights)
 
-    if args.rank != 0:
+    if args.local_rank != 0:
         logger.info("%s: Loaded Init Weights", my_identity)
     else:
         logger.info("%s: Sent Init Weights", my_identity)
 
-    print(f"Rank {args.rank}: Fellowship synchronized. All models are bit-for-bit identical.")
+    print(f"Rank {args.local_rank}: Fellowship synchronized. All models are bit-for-bit identical.")
 
     logger.info("Training/evaluation parameters %s", args)
 

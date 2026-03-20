@@ -1,7 +1,7 @@
-export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
+export GLUE_DIR=$HOME/cos568_pa2/glue_data
 export TASK_NAME=RTE
 
-python3 run_glue_skeleton.py \
+python3 task1.py \
   --model_type bert \
   --model_name_or_path bert-base-cased \
   --task_name $TASK_NAME \
